@@ -13,7 +13,10 @@ class EnhancedMotivationAnalyzer:
     def __init__(self):
         """Initialize the enhanced analyzer with AI capabilities"""
         # Initialize OpenAI client for advanced analysis
-        self.client = OpenAI()
+        api_key = os.environ.get('OPENAI_API_KEY')
+        if not api_key:
+            raise ValueError('OPENAI_API_KEY environment variable not set')
+        self.client = OpenAI(api_key=api_key)
         
         # Motivation keywords and phrases (expanded)
         self.high_motivation_keywords = [
