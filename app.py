@@ -95,6 +95,26 @@ def analyze_audio():
                     'remaining_minutes': remaining
                 }), 429
             
+            # Check file size and compress if needed (Whisper has 25MB limit)
+            MAX_FILE_SIZE_MB = 24  # Stay under 25MB limit with buffer
+            if file_size_mb > MAX_FILE_SIZE_MB:
+                # Compress audio file
+                from pydub import AudioSegment
+                compressed_filepath = filepath.replace(filename, f"compressed_{filename}").replace(filepath.split('.')[-1], 'mp3')
+                
+                # Load audio and export with lower bitrate
+                audio = AudioSegment.from_file(filepath)
+                # Calculate target bitrate to get under 25MB
+                duration_seconds = len(audio) / 1000
+                target_bitrate = int((MAX_FILE_SIZE_MB * 1024 * 8) / duration_seconds)  # kbps
+                target_bitrate = min(target_bitrate, 64)  # Cap at 64kbps for quality
+                
+                audio.export(compressed_filepath, format="mp3", bitrate=f"{target_bitrate}k")
+                
+                # Remove original, use compressed
+                os.remove(filepath)
+                filepath = compressed_filepath
+            
             # Transcribe audio using OpenAI Whisper API
             # Use the same client from analyzer that's already working
             with open(filepath, 'rb') as audio_data:
