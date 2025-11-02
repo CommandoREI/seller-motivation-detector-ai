@@ -1038,8 +1038,19 @@ Seller: We need to close within 30 days if possible. The house needs some work b
         // Handle file selection
         document.getElementById('audioFile').addEventListener('change', function(e) {
             if (e.target.files.length > 0) {
-                document.getElementById('audioCard').classList.add('active');
+                const file = e.target.files[0];
+                const fileName = file.name;
+                const fileSize = (file.size / (1024 * 1024)).toFixed(2); // MB
+                
+                // Show filename on the button
+                const audioCard = document.getElementById('audioCard');
+                audioCard.classList.add('active');
                 document.getElementById('transcriptCard').classList.remove('active');
+                
+                // Update button text to show selected file
+                const btn = audioCard.querySelector('.upload-btn');
+                btn.textContent = `✓ ${fileName} (${fileSize} MB)`;
+                btn.style.background = 'linear-gradient(135deg, #4caf50 0%, #45a049 100%)';
             }
         });
         
