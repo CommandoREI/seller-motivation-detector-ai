@@ -1,0 +1,12 @@
+@app.route('/api/usage-stats', methods=['GET'])
+def get_usage_stats():
+    """Get usage statistics for current user"""
+    try:
+        user_id = request.args.get('user_id', 'anonymous')
+        stats = usage_tracker.get_usage_stats(user_id)
+        return jsonify({
+            'success': True,
+            'stats': stats
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500

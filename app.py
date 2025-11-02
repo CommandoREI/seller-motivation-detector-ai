@@ -1,10 +1,11 @@
-from flask import Flask, request, jsonify, render_template_string, send_file
+from flask import Flask, request, jsonify, render_template_string
 from flask_cors import CORS
 import os
 import json
 from datetime import datetime
 import subprocess
 from ai_analyzer import EnhancedMotivationAnalyzer
+from usage_tracker import UsageTracker
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
@@ -26,6 +27,9 @@ app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100MB max file size
 
 # Initialize enhanced analyzer
 analyzer = EnhancedMotivationAnalyzer()
+
+# Initialize usage tracker
+usage_tracker = UsageTracker()
 
 @app.route('/')
 def index():
@@ -60,6 +64,9 @@ def analyze_transcript():
 def analyze_audio():
     """Analyze uploaded audio file for seller motivation"""
     try:
+        # Get user ID from request (from WordPress or session)
+        user_id = request.form.get('user_id', 'anonymous')
+        
         if 'audio' not in request.files:
             return jsonify({'error': 'No audio file provided'}), 400
         
@@ -72,26 +79,38 @@ def analyze_audio():
         filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
         audio_file.save(filepath)
         
-        # Transcribe audio using manus-speech-to-text utility
         try:
-            result = subprocess.run(['manus-speech-to-text', filepath], 
-                                  capture_output=True, text=True, timeout=300)
+            # Get audio duration for usage tracking
+            file_size_mb = os.path.getsize(filepath) / (1024 * 1024)
+            # Estimate duration: ~1MB per minute for typical audio
+            estimated_duration_minutes = file_size_mb
             
-            if result.returncode == 0 and result.stdout.strip():
-                transcript = result.stdout.strip()
-            else:
-                # Fallback: create demo transcript for testing
-                transcript = """Seller: Hi, I'm calling about selling my house at 123 Main Street. I really need to sell quickly.
-Agent: I'd be happy to help. Tell me about your situation and timeline.
-Seller: Well, we're going through a divorce and it's been really stressful. We're behind on a couple mortgage payments and just want to get this resolved. The house needs some work but we can't afford to fix it up right now.
-Agent: I understand that must be difficult. How quickly do you need to close?
-Seller: Ideally within 30-45 days if possible. We're flexible on price if you can close fast and buy it as-is. We just want to move on.
-Agent: That sounds workable. Are you open to a cash offer?
-Seller: Yes, definitely. We just want certainty and to split the proceeds so we can both move forward with our lives.
-Agent: I appreciate your openness. What condition is the property in?
-Seller: It needs some repairs - the roof has a few leaks, the HVAC is old, and there's some deferred maintenance. We've been overwhelmed dealing with everything and just can't handle it anymore.
-Agent: I understand. Have you talked to any other buyers or investors?
-Seller: We had a realtor but the listing expired. We're tired of waiting and just want a quick, certain sale. No more showings, no more waiting."""
+            # Check usage limits before processing
+            can_proceed, remaining = usage_tracker.check_audio_limit(user_id, estimated_duration_minutes)
+            if not can_proceed:
+                os.remove(filepath)
+                return jsonify({
+                    'error': f'Monthly audio limit exceeded. You have {remaining:.1f} minutes remaining this month. Limit: 500 minutes/month.',
+                    'limit_exceeded': True,
+                    'remaining_minutes': remaining
+                }), 429
+            
+            # Transcribe audio using OpenAI Whisper API
+            from openai import OpenAI
+            client = OpenAI()
+            
+            with open(filepath, 'rb') as audio_data:
+                transcription = client.audio.transcriptions.create(
+                    model="whisper-1",
+                    file=audio_data,
+                    response_format="verbose_json"
+                )
+            
+            transcript = transcription.text
+            actual_duration_minutes = transcription.duration / 60  # Convert seconds to minutes
+            
+            # Record actual usage
+            usage_tracker.record_audio_usage(user_id, actual_duration_minutes)
             
             # Clean up uploaded file
             os.remove(filepath)
@@ -99,16 +118,18 @@ Seller: We had a realtor but the listing expired. We're tired of waiting and jus
             # Analyze the transcript using enhanced analyzer
             analysis = analyzer.analyze_transcript(transcript)
             
+            # Get updated usage stats
+            usage_stats = usage_tracker.get_usage_stats(user_id)
+            
             return jsonify({
                 'success': True,
                 'transcript': transcript,
                 'analysis': analysis,
+                'audio_duration_minutes': round(actual_duration_minutes, 2),
+                'usage_stats': usage_stats,
                 'timestamp': datetime.now().isoformat()
             })
         
-        except subprocess.TimeoutExpired:
-            os.remove(filepath)
-            return jsonify({'error': 'Audio transcription timed out'}), 500
         except Exception as e:
             if os.path.exists(filepath):
                 os.remove(filepath)
@@ -116,6 +137,19 @@ Seller: We had a realtor but the listing expired. We're tired of waiting and jus
     
     except Exception as e:
         print(f"Error analyzing audio: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/usage-stats', methods=['GET'])
+def get_usage_stats():
+    """Get usage statistics for current user"""
+    try:
+        user_id = request.args.get('user_id', 'anonymous')
+        stats = usage_tracker.get_usage_stats(user_id)
+        return jsonify({
+            'success': True,
+            'stats': stats
+        })
+    except Exception as e:
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/export-pdf', methods=['POST'])
@@ -838,6 +872,27 @@ HTML_TEMPLATE = '''
         </div>
         
         <div class="main-content">
+            <!-- Usage Stats Display -->
+            <div id="usageStatsBar" style="background: linear-gradient(135deg, #e8f5e9 0%, #c8e6c9 100%); padding: 15px 25px; border-radius: 8px; margin-bottom: 30px; display: none; border-left: 4px solid #4caf50;">
+                <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 15px;">
+                    <div>
+                        <strong style="color: #2e7d32; font-size: 1.1rem;">📊 Your Monthly Usage</strong>
+                    </div>
+                    <div style="display: flex; gap: 30px; flex-wrap: wrap;">
+                        <div>
+                            <span style="color: #5a6c5a; font-size: 0.9rem;">Audio Minutes:</span>
+                            <strong id="audioMinutesUsed" style="color: #2e7d32; font-size: 1.1rem; margin-left: 8px;">0</strong>
+                            <span style="color: #7a8a7a; font-size: 0.9rem;"> / 500</span>
+                        </div>
+                        <div>
+                            <span style="color: #5a6c5a; font-size: 0.9rem;">Remaining:</span>
+                            <strong id="audioMinutesRemaining" style="color: #2e7d32; font-size: 1.1rem; margin-left: 8px;">500</strong>
+                            <span style="color: #7a8a7a; font-size: 0.9rem;"> minutes</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
             <div class="upload-section">
                 <div class="upload-card" id="audioCard">
                     <div class="upload-icon">🎙️</div>
@@ -996,6 +1051,43 @@ Seller: We need to close within 30 days if possible. The house needs some work b
             }
         });
         
+        // Load and display usage stats on page load
+        async function loadUsageStats() {
+            try {
+                const userId = getUserId();
+                const response = await fetch(`/api/usage-stats?user_id=${userId}`);
+                const data = await response.json();
+                
+                if (data.success) {
+                    updateUsageDisplay(data.stats);
+                }
+            } catch (error) {
+                console.error('Error loading usage stats:', error);
+            }
+        }
+        
+        function getUserId() {
+            // Try to get user ID from WordPress or use anonymous
+            return window.wpUserId || 'anonymous';
+        }
+        
+        function updateUsageDisplay(stats) {
+            document.getElementById('usageStatsBar').style.display = 'block';
+            document.getElementById('audioMinutesUsed').textContent = Math.round(stats.audio_minutes_used);
+            document.getElementById('audioMinutesRemaining').textContent = Math.round(stats.audio_minutes_remaining);
+            
+            // Change color if running low
+            const remaining = stats.audio_minutes_remaining;
+            const usageBar = document.getElementById('usageStatsBar');
+            if (remaining < 50) {
+                usageBar.style.background = 'linear-gradient(135deg, #fff3e0 0%, #ffe0b2 100%)';
+                usageBar.style.borderLeftColor = '#ff9800';
+            } else if (remaining < 100) {
+                usageBar.style.background = 'linear-gradient(135deg, #fff9c4 0%, #fff59d 100%)';
+                usageBar.style.borderLeftColor = '#ffc107';
+            }
+        }
+        
         async function analyzeMotivation() {
             const audioFile = document.getElementById('audioFile').files[0];
             const transcript = document.getElementById('transcriptText').value.trim();
@@ -1012,11 +1104,13 @@ Seller: We need to close within 30 days if possible. The house needs some work b
             
             try {
                 let response;
+                const userId = getUserId();
                 
                 if (audioFile) {
                     // Upload and analyze audio
                     const formData = new FormData();
                     formData.append('audio', audioFile);
+                    formData.append('user_id', userId);
                     
                     response = await fetch('/api/analyze-audio', {
                         method: 'POST',
@@ -1035,8 +1129,25 @@ Seller: We need to close within 30 days if possible. The house needs some work b
                 
                 const data = await response.json();
                 
+                if (response.status === 429) {
+                    // Usage limit exceeded
+                    alert(data.error || 'Monthly usage limit exceeded. Please try again next month.');
+                    return;
+                }
+                
                 if (data.success) {
                     displayResults(data.analysis, data.transcript);
+                    
+                    // Update usage stats if returned
+                    if (data.usage_stats) {
+                        updateUsageDisplay(data.usage_stats);
+                    }
+                    
+                    // Show audio duration if available
+                    if (data.audio_duration_minutes) {
+                        const durationMsg = `Audio transcribed: ${data.audio_duration_minutes.toFixed(1)} minutes`;
+                        console.log(durationMsg);
+                    }
                 } else {
                     alert('Error: ' + (data.error || 'Unknown error occurred'));
                 }
@@ -1048,6 +1159,9 @@ Seller: We need to close within 30 days if possible. The house needs some work b
                 document.getElementById('analyzeBtn').disabled = false;
             }
         }
+        
+        // Load usage stats when page loads
+        document.addEventListener('DOMContentLoaded', loadUsageStats);
         
         function displayResults(analysis, transcript) {
             currentAnalysis = analysis;
