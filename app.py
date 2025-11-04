@@ -6,6 +6,8 @@ from datetime import datetime
 import subprocess
 from ai_analyzer import EnhancedMotivationAnalyzer
 from usage_tracker import UsageTracker
+from job_queue import job_queue
+from async_worker import start_async_job
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
@@ -62,7 +64,7 @@ def analyze_transcript():
 
 @app.route('/api/analyze-audio', methods=['POST'])
 def analyze_audio():
-    """Analyze uploaded audio file for seller motivation"""
+    """Analyze uploaded audio file for seller motivation (ASYNC VERSION)"""
     try:
         # Get user ID from request (from WordPress or session)
         user_id = request.form.get('user_id', 'anonymous')
@@ -95,58 +97,16 @@ def analyze_audio():
                     'remaining_minutes': remaining
                 }), 429
             
-            # Check file size and compress if needed (Whisper has 25MB limit)
-            MAX_FILE_SIZE_MB = 24  # Stay under 25MB limit with buffer
-            if file_size_mb > MAX_FILE_SIZE_MB:
-                # Compress audio file
-                from pydub import AudioSegment
-                compressed_filepath = filepath.replace(filename, f"compressed_{filename}").replace(filepath.split('.')[-1], 'mp3')
-                
-                # Load audio and export with lower bitrate
-                audio = AudioSegment.from_file(filepath)
-                # Calculate target bitrate to get under 25MB
-                duration_seconds = len(audio) / 1000
-                target_bitrate = int((MAX_FILE_SIZE_MB * 1024 * 8) / duration_seconds)  # kbps
-                target_bitrate = min(target_bitrate, 64)  # Cap at 64kbps for quality
-                
-                audio.export(compressed_filepath, format="mp3", bitrate=f"{target_bitrate}k")
-                
-                # Remove original, use compressed
-                os.remove(filepath)
-                filepath = compressed_filepath
+            # Start async processing job
+            job_id = start_async_job(filepath, user_id, analyzer, usage_tracker, app.config)
             
-            # Transcribe audio using OpenAI Whisper API
-            # Use the same client from analyzer that's already working
-            with open(filepath, 'rb') as audio_data:
-                transcription = analyzer.client.audio.transcriptions.create(
-                    model="whisper-1",
-                    file=audio_data,
-                    response_format="verbose_json"
-                )
-            
-            transcript = transcription.text
-            actual_duration_minutes = transcription.duration / 60  # Convert seconds to minutes
-            
-            # Record actual usage
-            usage_tracker.record_audio_usage(user_id, actual_duration_minutes)
-            
-            # Clean up uploaded file
-            os.remove(filepath)
-            
-            # Analyze the transcript using enhanced analyzer
-            analysis = analyzer.analyze_transcript(transcript)
-            
-            # Get updated usage stats
-            usage_stats = usage_tracker.get_usage_stats(user_id)
-            
+            # Return job ID immediately
             return jsonify({
                 'success': True,
-                'transcript': transcript,
-                'analysis': analysis,
-                'audio_duration_minutes': round(actual_duration_minutes, 2),
-                'usage_stats': usage_stats,
-                'timestamp': datetime.now().isoformat()
-            })
+                'job_id': job_id,
+                'status': 'processing',
+                'message': 'Audio uploaded successfully. Processing in background...'
+            }), 202  # 202 Accepted
         
         except Exception as e:
             if os.path.exists(filepath):
@@ -167,6 +127,38 @@ def get_usage_stats():
             'success': True,
             'stats': stats
         })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/job-status/<job_id>', methods=['GET'])
+def get_job_status(job_id):
+    """Get status of async processing job"""
+    try:
+        job = job_queue.get_job(job_id)
+        
+        if not job:
+            return jsonify({'error': 'Job not found'}), 404
+        
+        # Return job status
+        response = {
+            'job_id': job['job_id'],
+            'status': job['status'],
+            'progress': job['progress'],
+            'message': job['message'],
+            'created_at': job['created_at'].isoformat(),
+            'updated_at': job['updated_at'].isoformat()
+        }
+        
+        # Include result if complete
+        if job['status'] == 'complete' and job['result']:
+            response['result'] = job['result']
+        
+        # Include error if failed
+        if job['status'] == 'error' and job['error']:
+            response['error'] = job['error']
+        
+        return jsonify(response)
+    
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -1117,6 +1109,58 @@ Seller: We need to close within 30 days if possible. The house needs some work b
             }
         }
         
+        async function pollJobStatus(jobId) {
+            // Poll job status every 3 seconds
+            const maxAttempts = 120; // 6 minutes max
+            let attempts = 0;
+            
+            while (attempts < maxAttempts) {
+                try {
+                    const response = await fetch(`/api/job-status/${jobId}`);
+                    const job = await response.json();
+                    
+                    // Update loading message with progress
+                    const loadingText = document.querySelector('#loading p');
+                    if (loadingText) {
+                        loadingText.textContent = `${job.message} (${job.progress}%)`;
+                    }
+                    
+                    if (job.status === 'complete' && job.result) {
+                        // Job finished successfully
+                        const result = job.result;
+                        displayResults(result.analysis, result.transcript);
+                        
+                        if (result.usage_stats) {
+                            updateUsageDisplay(result.usage_stats);
+                        }
+                        
+                        if (result.audio_duration_minutes) {
+                            console.log(`Audio transcribed: ${result.audio_duration_minutes.toFixed(1)} minutes`);
+                        }
+                        
+                        return true;
+                    } else if (job.status === 'error') {
+                        // Job failed
+                        alert('Error: ' + (job.error || 'Unknown error occurred'));
+                        return false;
+                    }
+                    
+                    // Job still processing, wait and try again
+                    await new Promise(resolve => setTimeout(resolve, 3000));
+                    attempts++;
+                    
+                } catch (error) {
+                    console.error('Error polling job status:', error);
+                    await new Promise(resolve => setTimeout(resolve, 3000));
+                    attempts++;
+                }
+            }
+            
+            // Timeout
+            alert('Processing timeout. Please try again with a shorter audio file.');
+            return false;
+        }
+        
         async function analyzeMotivation() {
             const audioFile = document.getElementById('audioFile').files[0];
             const transcript = document.getElementById('transcriptText').value.trim();
@@ -1136,7 +1180,7 @@ Seller: We need to close within 30 days if possible. The house needs some work b
                 const userId = getUserId();
                 
                 if (audioFile) {
-                    // Upload and analyze audio
+                    // Upload and analyze audio (async)
                     const formData = new FormData();
                     formData.append('audio', audioFile);
                     formData.append('user_id', userId);
@@ -1145,8 +1189,25 @@ Seller: We need to close within 30 days if possible. The house needs some work b
                         method: 'POST',
                         body: formData
                     });
+                    
+                    const data = await response.json();
+                    
+                    if (response.status === 429) {
+                        alert(data.error || 'Monthly usage limit exceeded. Please try again next month.');
+                        return;
+                    }
+                    
+                    if (response.status === 202 && data.job_id) {
+                        // Audio processing started, poll for results
+                        await pollJobStatus(data.job_id);
+                    } else if (data.success) {
+                        // Immediate success (shouldn't happen with new async flow)
+                        displayResults(data.analysis, data.transcript);
+                    } else {
+                        alert('Error: ' + (data.error || 'Unknown error occurred'));
+                    }
                 } else {
-                    // Analyze transcript
+                    // Analyze transcript (still synchronous)
                     response = await fetch('/api/analyze-transcript', {
                         method: 'POST',
                         headers: {
@@ -1154,31 +1215,14 @@ Seller: We need to close within 30 days if possible. The house needs some work b
                         },
                         body: JSON.stringify({ transcript })
                     });
-                }
-                
-                const data = await response.json();
-                
-                if (response.status === 429) {
-                    // Usage limit exceeded
-                    alert(data.error || 'Monthly usage limit exceeded. Please try again next month.');
-                    return;
-                }
-                
-                if (data.success) {
-                    displayResults(data.analysis, data.transcript);
                     
-                    // Update usage stats if returned
-                    if (data.usage_stats) {
-                        updateUsageDisplay(data.usage_stats);
-                    }
+                    const data = await response.json();
                     
-                    // Show audio duration if available
-                    if (data.audio_duration_minutes) {
-                        const durationMsg = `Audio transcribed: ${data.audio_duration_minutes.toFixed(1)} minutes`;
-                        console.log(durationMsg);
+                    if (data.success) {
+                        displayResults(data.analysis, data.transcript);
+                    } else {
+                        alert('Error: ' + (data.error || 'Unknown error occurred'));
                     }
-                } else {
-                    alert('Error: ' + (data.error || 'Unknown error occurred'));
                 }
             } catch (error) {
                 console.error('Error:', error);
